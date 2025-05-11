@@ -1,110 +1,122 @@
 import pandas as pd
-import re
 import nltk
-from nltk.tokenize import word_tokenize
-
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.pipeline import Pipeline, FeatureUnion
-from sklearn.feature_extraction.text import TfidfVectorizer
+import spacy
+from nltk.tokenize import word_tokenize, sent_tokenize
+from nltk.corpus import stopwords
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import classification_report
+from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy.sparse import hstack, csr_matrix
 
-# 1) Загрузка модели токенизации
+# Загрузка ресурсов
 nltk.download('punkt_tab')
+nltk.download('stopwords')
+nlp = spacy.load('en_core_web_sm')
+stop_words = set(stopwords.words('english'))
 
-# 2) Очистка текста
-def clean_text(text):
-    text = text.lower()
-    text = re.sub(r'http\S+|www\S+', '', text)
-    text = re.sub(r'[^a-zA-Z\s]', '', text)
-    return text
-
-# 3) Преобразователь чистого текста
-class TextCleaner(BaseEstimator, TransformerMixin):
-    def fit(self, X, y=None): return self
-    def transform(self, X, y=None):
-        return X.apply(clean_text)
-
-# 4) Экстрактор длины текста (число слов)
-class TextLengthExtractor(BaseEstimator, TransformerMixin):
-    def fit(self, X, y=None): return self
-    def transform(self, X, y=None):
-        return X.apply(lambda s: len(s.split())).values.reshape(-1, 1)
-
-# 5) Загружаем данные из result.csv
+# Загрузка данных
 df = pd.read_csv("result.csv")
 
-# 6) Разбиваем на train/test
-X_train, X_test, y_train, y_test = train_test_split(
-    df['text'], df['label'],
-    test_size=0.2,
-    random_state=42,
-    stratify=df['label']
-)
+# Трамповская лексика и местоимения
+trump_words = set([
+    "tremendous", "fake", "china", "great", "believe", "wall", "america", "again",
+    "media", "nobody", "genius", "winning", "hillary", "jobs", "big", "bad",
+    "deal", "kamala", "disaster", "strong", "success", "loser", "enemy", "sad", "historic", "obama", "she"
+])
+trump_pronouns = set(["i", "me", "we", "nobody"])
 
-# 7) Строим пайплайн
-pipeline = Pipeline([
-    ("features", FeatureUnion([
-        ("tfidf", TfidfVectorizer(
-            preprocessor=clean_text,
-            tokenizer=word_tokenize,
-            token_pattern=None,
-            ngram_range=(1, 2),
-            max_df=0.9,
-            min_df=2,
-            max_features=3000
-        )),
-        ("length", TextLengthExtractor())
-    ])),
-    ("classifier", RandomForestClassifier(
-        class_weight='balanced',
-        random_state=42
-    ))
+# Лемматизация и предобработка
+def preprocess_text(text):
+    doc = nlp(text)
+    tokens = [token.lemma_ for token in doc if token.is_alpha and token.text.lower() not in stop_words]
+    return ' '.join(tokens)
+
+# Ручные признаки
+def extract_trump_features(text):
+    tokens = word_tokenize(text.lower())
+    words = [w for w in tokens if w.isalpha()]
+    word_count = len(words)
+    sent_count = len(sent_tokenize(text))
+
+    trump_word_count = sum(1 for w in words if w in trump_words)
+    trump_pronoun_count = sum(1 for w in words if w in trump_pronouns)
+
+    return [
+        len(text),                   # длина текста (в символах)
+        sent_count,                  # количество предложений
+        trump_word_count / (word_count + 1e-6),  # доля "трамповских" слов
+        trump_pronoun_count / (word_count + 1e-6) # доля местоимений
+    ]
+
+# Применяем предобработку и извлекаем признаки
+df['processed'] = df['text'].apply(preprocess_text)
+manual_features = df['text'].apply(extract_trump_features).tolist()
+manual_features_df = pd.DataFrame(manual_features, columns=[
+    'char_length', 'sent_count', 'trump_word_ratio', 'trump_pronoun_ratio'
 ])
 
-# 8) Сетка гиперпараметров
+# Объединяем в один DataFrame
+df_full = df[['processed', 'label']].copy()
+df_full[['char_length', 'sent_count', 'trump_word_ratio', 'trump_pronoun_ratio']] = manual_features_df
+
+# Делим на train/test
+train_df, test_df = train_test_split(df_full, test_size=0.2, random_state=42)
+
+X_train_text = train_df['processed']
+X_test_text = test_df['processed']
+y_train = train_df['label']
+y_test = test_df['label']
+
+X_train_feat = train_df[['char_length', 'sent_count', 'trump_word_ratio', 'trump_pronoun_ratio']]
+X_test_feat = test_df[['char_length', 'sent_count', 'trump_word_ratio', 'trump_pronoun_ratio']]
+
+# TF-IDF векторизация
+vectorizer = TfidfVectorizer()
+X_train_vec = vectorizer.fit_transform(X_train_text)
+X_test_vec = vectorizer.transform(X_test_text)
+
+# Объединение TF-IDF и ручных признаков
+X_train_combined = hstack([X_train_vec, csr_matrix(X_train_feat.values)])
+X_test_combined = hstack([X_test_vec, csr_matrix(X_test_feat.values)])
+
+# RandomForest + GridSearch
 param_grid = {
-    "classifier__n_estimators": [100, 300],
-    "classifier__max_depth": [10, 20, None],
-    "classifier__min_samples_leaf": [1, 3, 5],
-    "classifier__max_features": ["sqrt", 0.3]
+    'n_estimators': [200],
+    'max_depth': [None],
+    'min_samples_split': [2],
+    'min_samples_leaf': [1],
+    'max_features': ['sqrt']
 }
 
-search = GridSearchCV(
-    pipeline,
-    param_grid,
-    cv=3,
-    scoring="f1",
-    n_jobs=-1,
-    verbose=1
-)
+rf = RandomForestClassifier(class_weight='balanced', random_state=42)
+grid_search = GridSearchCV(rf, param_grid, cv=5, n_jobs=-1, verbose=2)
+grid_search.fit(X_train_combined, y_train)
 
-# 9) Обучаем
-search.fit(X_train, y_train)
-print("Лучшие параметры:", search.best_params_)
+print("Best parameters found: ", grid_search.best_params_)
+model = grid_search.best_estimator_
 
-# 10) Оценка
-y_pred = search.predict(X_test)
-print("\nОтчёт на тестовой выборке:")
+# Оценка
+y_pred = model.predict(X_test_combined)
 print(classification_report(y_test, y_pred))
 
-# 11) Функция для проверки новых фраз
+# Предсказание новой фразы
 def predict_trump_quote(phrase):
-    clean = clean_text(phrase)
-    tokens = word_tokenize(clean)
-    joined = ' '.join(tokens)
-    vec = search.best_estimator_.named_steps['features'].transform(pd.Series([joined]))
-    pred = search.best_estimator_.named_steps['classifier'].predict(vec)[0]
-    proba = search.best_estimator_.named_steps['classifier'].predict_proba(vec)[0][1]
-    label = 'Трамп' if pred == 1 else 'Не Трамп'
-    print(f"Фраза: «{phrase}»\nВердикт: {label} (уверенность: {proba:.2f})")
-    return pred, proba
+    processed = preprocess_text(phrase)
+    tfidf = vectorizer.transform([processed])
+    manual = extract_trump_features(phrase)
+    combined = hstack([tfidf, csr_matrix([manual])])
+
+    prediction = model.predict(combined)[0]
+    proba = model.predict_proba(combined)[0][1]
+    print(f"Вердикт: {'Трамп' if prediction == 1 else 'Не Трамп'} (уверенность: {proba:.2f})")
+
 
 # 12) Примеры использования
 predict_trump_quote("We will make America great again.")
 predict_trump_quote("Fuck Hillary")
-predict_trump_quote("Fuck Kamala")
+predict_trump_quote("She is a bitch")
+predict_trump_quote("Fuck Obama")
 predict_trump_quote("We have the most smart people.")
 
 predict_trump_quote("To be or not to be.")
